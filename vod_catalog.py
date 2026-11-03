@@ -166,18 +166,27 @@ def _mb_ids():
 
 
 # --------------------------------------------------------------- stage 3
-def verify(item):
-    try:
-        if item["type"] == "series":
-            r = vod.resolve(item["imdb_id"], 1, 1, lang=LANG, provider="moviebox")
-        else:
-            r = vod.resolve(item["imdb_id"], lang=LANG, provider="moviebox")
-    except Exception:
-        return None
-    if r and r.get("kind") == "direct" and r.get("url"):
-        item = dict(item)
-        item["resolution"] = r.get("resolution") or 0
-        return item
+def verify(item, attempts=3):
+    """Resolve a real stream; keep only direct MP4s.
+
+    Concurrency causes a few percent of resolves to fail spuriously (the
+    playback endpoint rate-limits), so a None is retried with backoff before a
+    title is written off. Without this the catalogue silently loses titles.
+    """
+    for n in range(attempts):
+        try:
+            if item["type"] == "series":
+                r = vod.resolve(item["imdb_id"], 1, 1, lang=LANG, provider="moviebox")
+            else:
+                r = vod.resolve(item["imdb_id"], lang=LANG, provider="moviebox")
+        except Exception:
+            r = None
+        if r and r.get("kind") == "direct" and r.get("url"):
+            item = dict(item)
+            item["resolution"] = r.get("resolution") or 0
+            return item
+        if n < attempts - 1:
+            time.sleep(1.5 * (n + 1))
     return None
 
 
@@ -186,7 +195,8 @@ def episodes_of(imdb_id):
         eps = vod.episodes(imdb_id, lang=LANG)
     except Exception:
         return []
-    return [{"season": s, "episode": e} for s, e in eps if s and e]
+    # vod.episodes returns (season, episode, availability)
+    return [{"season": s, "episode": e} for s, e, _avail in eps if s and e]
 
 
 def stage_verify():
@@ -218,9 +228,15 @@ def stage_verify():
 
     print("episodes: %d series" % len(kept_s), flush=True)
     ep_map = {}
+
+    def _eps(sid):
+        try:
+            return sid, episodes_of(sid)
+        except Exception:
+            return sid, []
+
     with concurrent.futures.ThreadPoolExecutor(WORKERS) as ex:
-        for sid, eps in zip([s["imdb_id"] for s in kept_s],
-                            ex.map(episodes_of, [s["imdb_id"] for s in kept_s])):
+        for sid, eps in ex.map(_eps, [s["imdb_id"] for s in kept_s]):
             ep_map[sid] = eps or []
     for s in kept_s:
         s["episodes"] = ep_map.get(s["imdb_id"], [])
