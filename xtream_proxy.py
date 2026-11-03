@@ -7,6 +7,8 @@ All stream routes are authenticated. Live and VOD bytes are relayed with the
 upstream headers a TV player cannot supply, including HTTP Range support.
 """
 import hmac
+import gzip
+import html
 import json
 import os
 import re
@@ -29,6 +31,7 @@ USER = os.environ.get("EASYPLAY_USER", "easyplay")
 PASS = os.environ.get("EASYPLAY_PASS", "")
 DEFAULT_LANG = os.environ.get("EASYPLAY_VOD_LANG", "en")
 PUBLIC_URL = os.environ.get("EASYPLAY_PUBLIC_URL", "").rstrip("/")
+ACCESS_TOKEN = os.environ.get("EASYPLAY_ACCESS_TOKEN", PASS)
 LIVE_UA = "EasyPlay-Android/1.2.119"
 MAX_CONNECTIONS = int(os.environ.get("EASYPLAY_MAX_CONNECTIONS", "4"))
 
@@ -113,6 +116,18 @@ def _categories(items, default):
     return categories
 
 
+def _catalogue_status():
+    result = {}
+    for name in ("channels.json", "epg.xml", "vod.json", "report.json"):
+        modified = _mtime(os.path.join(PUB, name))
+        result[name] = {
+            "available": modified is not None,
+            "updated_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(modified / 1e9))
+            if modified else None,
+        }
+    return result
+
+
 class H(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
 
@@ -138,7 +153,9 @@ class H(BaseHTTPRequestHandler):
         if PUBLIC_URL:
             return PUBLIC_URL
         host = self.headers.get("Host") or "127.0.0.1:%d" % PORT
-        return "http://" + host
+        forwarded = self.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
+        scheme = forwarded if forwarded in ("http", "https") else "http"
+        return scheme + "://" + host
 
     @staticmethod
     def _credentials(username, password):
@@ -166,15 +183,36 @@ class H(BaseHTTPRequestHandler):
         path, query = parsed.path, urllib.parse.parse_qs(parsed.query)
         self._route = path.split("?", 1)[0]
 
+        if path == "/":
+            return self._status_page()
+
         if path == "/healthz":
             data = vod_data()
             return self._json({"status": "ok", "live_channels": len(live_channels()),
                                "movies": len(data.get("movies") or []),
-                               "series": len(data.get("series") or [])})
+                               "series": len(data.get("series") or []),
+                               "catalogue": _catalogue_status(),
+                               "refresh_schedule": {"live_hours": 6, "vod": "daily"}})
 
         if path == "/player_api.php":
             if not self._authorized(query):
                 return self._send(401, "unauthorized", "text/plain")
+            return self._player_api(query)
+
+        # Opaque-token URLs keep the Xtream password out of player settings
+        # and avoid conventional credential paths on public WAFs.
+        if path == "/t/%s/playlist.m3u" % ACCESS_TOKEN:
+            return self._send(200, self._m3u(), "audio/x-mpegurl; charset=utf-8")
+        if path == "/t/%s/epg.xml" % ACCESS_TOKEN:
+            return self._epg()
+
+        match = re.fullmatch(r"/t/%s/(live|movie|series)/(\d+)(?:\.\w+)?" % re.escape(ACCESS_TOKEN), path)
+        if match:
+            if match.group(1) == "series":
+                return self._stream_episode(int(match.group(2)))
+            return self._stream_live_or_movie(int(match.group(2)))
+
+        if path == "/t/%s/api" % ACCESS_TOKEN:
             return self._player_api(query)
 
         if path in ("/get.php", "/playlist.m3u"):
@@ -200,6 +238,33 @@ class H(BaseHTTPRequestHandler):
             return self._stream_episode(int(match.group(3)))
 
         self._send(404, "not found", "text/plain")
+
+    def _status_page(self):
+        data = vod_data()
+        report = read_json(os.path.join(PUB, "report.json"), {})
+        rows = "".join(
+            "<tr><td>%s</td><td>%s</td></tr>" % (html.escape(name), html.escape(str(status["updated_utc"] or "not built")))
+            for name, status in _catalogue_status().items())
+        page = """<!doctype html><html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex">
+<title>EasyPlayTV status</title><style>body{font:16px system-ui;max-width:720px;margin:3rem auto;padding:0 1rem;background:#10141b;color:#edf2f7}a{color:#7cc7ff}table{border-collapse:collapse;width:100%%}td{padding:.7rem;border-bottom:1px solid #384454}.ok{color:#82e6a5}.muted{color:#a4b0bf}</style></head>
+<body><h1>EasyPlayTV</h1><p class="ok">Proxy online · automatic updates enabled</p>
+<p>%d live channels · %d movies · %d series</p>
+<p>Live TV and EPG refresh every 6 hours. VOD refreshes daily at 04:30.</p>
+<h2>Catalogue files (UTC)</h2><table>%s</table>
+<p class="muted">TiviMate: add an Xtream Codes account using this server's URL and your private credentials. For M3U auto-update, use the authenticated <code>/get.php?type=m3u</code> URL. Credentials are never displayed here.</p>
+<p><a href="https://github.com/padey88/easyplaytv">Project and setup guide</a> · <a href="/healthz">Health JSON</a></p>
+</body></html>""" % (len(live_channels()), len(data.get("movies") or []),
+                       len(data.get("series") or []), rows)
+        body = page.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        if not getattr(self, "_head", False):
+            self.wfile.write(body)
 
     def _player_api(self, query):
         action = query.get("action", [""])[0]
@@ -271,13 +336,11 @@ class H(BaseHTTPRequestHandler):
             movie = _movie(ident)
             if not movie:
                 return self._send(404, "{}")
-            credentials = "%s/%s" % (urllib.parse.quote(USER, safe=""),
-                                     urllib.parse.quote(PASS, safe=""))
             return self._json({
                 "info": self._movie_info(movie),
                 "movie_data": {"stream_id": ident, "name": movie.get("name") or "",
                                "container_extension": "mp4"},
-                "stream_url": "%s/movie/%s/%d.mp4" % (self._base(), credentials, ident),
+                "stream_url": "%s/t/%s/movie/%d.mp4" % (self._base(), ACCESS_TOKEN, ident),
             })
         if action == "get_series_categories":
             return self._json(_categories(series, "Series"))
@@ -426,14 +489,24 @@ class H(BaseHTTPRequestHandler):
                 body = stream.read()
         except OSError:
             return self._send(404, "EPG not built", "text/plain")
-        self._send(200, body, "application/xml; charset=utf-8")
+        compressed = "gzip" in self.headers.get("Accept-Encoding", "")
+        if compressed:
+            body = gzip.compress(body, compresslevel=4, mtime=0)
+        self.send_response(200)
+        self.send_header("Content-Type", "application/xml; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Vary", "Accept-Encoding")
+        if compressed:
+            self.send_header("Content-Encoding", "gzip")
+        self.end_headers()
+        if not getattr(self, "_head", False):
+            self.wfile.write(body)
 
     def _m3u(self):
-        credentials = "%s/%s" % (urllib.parse.quote(USER, safe=""),
-                                 urllib.parse.quote(PASS, safe=""))
         base = self._base()
-        lines = ['#EXTM3U url-tvg="%s/xmltv.php?username=%s&password=%s"'
-                 % (base, urllib.parse.quote(USER), urllib.parse.quote(PASS))]
+        token = urllib.parse.quote(ACCESS_TOKEN, safe="")
+        epg = "%s/t/%s/epg.xml" % (base, token)
+        lines = ['#EXTM3U url-tvg="%s" x-tvg-url="%s"' % (epg, epg)]
         for number, channel in enumerate(live_channels(), start=LIVE_BASE):
             attributes = ""
             if channel.get("tvg_id"):
@@ -442,7 +515,7 @@ class H(BaseHTTPRequestHandler):
                 attributes += ' tvg-logo="%s"' % channel["logo"]
             attributes += ' group-title="%s"' % (channel.get("group") or "Live TV")
             lines.append("#EXTINF:-1%s,%s" % (attributes, channel.get("name") or ""))
-            lines.append("%s/live/%s/%d.ts" % (base, credentials, number))
+            lines.append("%s/t/%s/live/%d.ts" % (base, token, number))
         return "\n".join(lines) + "\n"
 
 

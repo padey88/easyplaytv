@@ -106,6 +106,68 @@ The exact menu labels differ slightly between TiviMate versions. TiviMate 5.x
 is the intended client; other Xtream-compatible players have not been formally
 qualified.
 
+## Fire TV / TiviMate setup
+
+The deployment at `https://easyplaytv.kulnem.space` automatically retrieves the
+current channel list from the EasyPlay service used by the APK. You do not need
+to sideload the APK, copy its tokens, or run backend commands on the Fire TV.
+
+### Recommended: one M3U playlist with automatic updates
+
+1. Install TiviMate from its official source.
+2. Open **Settings → Playlists → Add playlist → M3U playlist**.
+3. Use the private playlist URL:
+   `https://easyplaytv.kulnem.space/t/YOUR_ACCESS_TOKEN/playlist.m3u`
+4. Enable **Auto-update**. Set the playlist and EPG update interval to **6 hours**.
+   TiviMate 5.1.5's minimum interval is 6 hours, not minutes.
+5. The M3U includes both `x-tvg-url` and `url-tvg` for its matching guide. If
+   your version does not import it automatically, use:
+   `https://easyplaytv.kulnem.space/t/YOUR_ACCESS_TOKEN/epg.xml`
+
+The access token is the `EASYPLAY_ACCESS_TOKEN` value in the server's `.env`;
+it is deliberately not displayed on the public status page or committed to
+GitHub. Treat the full M3U URL as a password.
+
+### Optional: Xtream Codes account for Movies and TV Shows
+
+For the integrated VOD interface, add an **Xtream Codes** playlist instead:
+
+- Server: `https://easyplaytv.kulnem.space`
+- Username and password: `EASYPLAY_USER` and `EASYPLAY_PASS` from `.env`.
+
+Do not add both methods simultaneously unless you intentionally want duplicate
+live channels. The M3U method is simplest for live TV; Xtream adds VOD.
+
+## Automatic backend refresh
+
+`deploy/install.py` enables two user-systemd timers:
+
+- Live channel lease, M3U, logos and EPG: every **6 hours**, starting 5 minutes
+  after boot, with up to 10 minutes randomized delay.
+- VOD availability and playback verification: daily at **04:30**, with up to
+  30 minutes randomized delay.
+
+Missed runs are caught up with `Persistent=true`. The proxy reloads changed
+catalogue files automatically; there is no restart after a refresh. Failed
+builds exit nonzero and leave the previous valid catalogue in place.
+
+```bash
+systemctl --user list-timers 'easyplaytv-*'
+systemctl --user status 'easyplaytv-refresh@*.service'
+journalctl --user -u easyplaytv-refresh@live.service
+journalctl --user -u easyplaytv-refresh@vod.service
+```
+
+For a manual refresh:
+
+```bash
+systemctl --user start easyplaytv-refresh@live.service
+systemctl --user start easyplaytv-refresh@vod.service
+```
+
+The status page at `/` shows aggregate counts and last-published timestamps.
+`/healthz` exposes the same operational information without credentials.
+
 ## Run as a service
 
 The installer renders a user-level systemd service for the current checkout,
@@ -166,6 +228,7 @@ can otherwise silently remove valid titles.
 | `EASYPLAY_PASS` | none | Required password; empty is rejected |
 | `EASYPLAY_VOD_LANG` | `en` | Preferred on-demand audio language |
 | `EASYPLAY_PUBLIC_URL` | request host | Base URL written into playlist/stream links |
+| `EASYPLAY_ACCESS_TOKEN` | `EASYPLAY_PASS` | Independent opaque token for M3U/EPG/stream links |
 | `EASYPLAY_CATALOGUE_PAGES` | `30` | Cinemeta pages per genre |
 | `EASYPLAY_CATALOGUE_WORKERS` | `6` | Concurrent catalogue lookups |
 

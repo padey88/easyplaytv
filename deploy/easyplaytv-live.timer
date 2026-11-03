@@ -1,0 +1,12 @@
+[Unit]
+Description=Refresh EasyPlayTV live channels and EPG every 6 hours
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=6h
+RandomizedDelaySec=10min
+Persistent=true
+Unit=easyplaytv-refresh@live.service
+
+[Install]
+WantedBy=timers.target

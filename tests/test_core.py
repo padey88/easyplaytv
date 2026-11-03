@@ -142,6 +142,28 @@ class ProxyTests(unittest.TestCase):
             status, _ = self.request(path)
             self.assertEqual(status, 401, path)
 
+    def test_opaque_token_feed_and_media(self):
+        token = xtream_proxy.ACCESS_TOKEN
+        status, body = self.request("/t/%s/playlist.m3u" % token)
+        self.assertEqual(status, 200)
+        body = body.decode()
+        self.assertIn("/t/%s/live/1.ts" % token, body)
+        self.assertIn("/t/%s/epg.xml" % token, body)
+        with mock.patch.object(xtream_proxy.H, "_relay", lambda handler, url, headers: handler._send(200, b"MPEGTS", "video/mp2t")):
+            status, body = self.request("/t/%s/live/1.ts" % token)
+        self.assertEqual((status, body), (200, b"MPEGTS"))
+        status, body = self.request("/t/%s/api?action=get_vod_streams" % token)
+        self.assertEqual(json.loads(body)[0]["stream_id"], identifiers.movie_id("tt0000001"))
+        status, _ = self.request("/t/wrong/playlist.m3u")
+        self.assertEqual(status, 404)
+
+    def test_status_page_is_public_and_head_is_bodyless(self):
+        status, body = self.request("/")
+        self.assertEqual(status, 200)
+        self.assertIn("automatic updates enabled", body.decode())
+        status, body = self.request("/", method="HEAD")
+        self.assertEqual((status, body), (200, b""))
+
     def test_xtream_catalogue_uses_stable_ids(self):
         auth = "username=easyplay&password=test-secret"
         status, body = self.request("/player_api.php?%s&action=get_vod_streams" % auth)

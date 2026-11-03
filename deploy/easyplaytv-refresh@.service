@@ -1,0 +1,17 @@
+[Unit]
+Description=EasyPlayTV %i catalogue refresh
+After=network-online.target easyplaytv.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__PROJECT_DIR__
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=__PROJECT_DIR__/.env
+ExecStart=__PYTHON__ __PROJECT_DIR__/refresh.py %i
+TimeoutStartSec=2h
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=__PROJECT_DIR__/public __PROJECT_DIR__/epg_cache __PROJECT_DIR__/.easyplay_device.json

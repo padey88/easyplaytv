@@ -1,5 +1,13 @@
 # Changelog
 
+## 1.1.0 - 2026-11-03
+
+### Added
+- Automatic live/EPG refresh every 6 hours and daily VOD verification.
+- Opaque-token M3U, EPG, and stream routes for public WAF compatibility.
+- Public status page and catalogue timestamps in `/healthz`.
+- Fire TV/TiviMate automatic-update instructions.
+
 ## 1.0.0 - 2026-11-03
 
 ### Added
