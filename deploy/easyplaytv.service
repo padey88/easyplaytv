@@ -1,0 +1,17 @@
+[Unit]
+Description=EasyPlayTV Xtream proxy (live TV + VOD for TiviMate)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/hermes/easyplaytv
+Environment=EASYPLAY_PORT=8601
+Environment=EASYPLAY_USER=easyplay
+EnvironmentFile=-/home/hermes/easyplaytv/.env
+ExecStart=/usr/bin/python3 /home/hermes/easyplaytv/xtream_proxy.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target
