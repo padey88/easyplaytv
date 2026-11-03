@@ -1,265 +1,294 @@
 #!/usr/bin/env python3
-"""Build the on-demand catalogue that the Xtream proxy exposes to TiviMate.
+"""Build the on-demand catalogue served by the Xtream proxy.
 
-Staged and resumable — each stage caches to disk, so a crash or a kill costs
-only the stage in flight, not the whole run:
+Stages:
+  candidates  Cinemeta genre catalogues -> public/candidates.jsonl
+  filter      EasyPlay provider support -> public/provider_cache.json
+  verify      Direct MP4 resolution      -> public/vod.json
 
-  1. candidates  Cinemeta (Stremio's public IMDb catalogues), deep-paginated
-                 across genres  -> public/candidates.jsonl
-  2. filter      EasyPlay's per-title lookup reports which providers carry a
-                 title. Only ~6% carry `moviebox`, and only moviebox returns a
-                 direct MP4 (`vidsrc` returns a web-player embed TiviMate cannot
-                 play). Far cheaper than resolving every candidate.
-                 -> public/candidates_mb.jsonl
-  3. verify      Resolve a real stream (S1E1 for series); keep only kind=direct.
-                 -> public/vod.json
+Every stage is resumable. Completed genre blocks and provider lookups are not
+repeated on later runs. Catalogue data is written atomically so a reader never
+sees a partial file. Use --rebuild to deliberately fetch a fresh catalogue.
 
-Run `python3 vod_catalog.py` to do all three, or pass a stage name:
-  candidates | filter | verify
-
-Depth note: the bare `top` Cinemeta feed ignores `skip` and always returns the
-same 50 titles, so breadth has to come from the genre feeds, which do paginate.
+The filter records *both* positive and negative answers. Otherwise every
+unavailable IMDb title is fetched again on every run. A short-lived per-process
+lock prevents concurrent writers from corrupting or duplicating the cache.
 """
 import concurrent.futures
+import contextlib
+import fcntl
 import json
 import os
 import sys
 import time
 
 import vod
+from storage import atomic_write, cache_key, read_json, read_jsonl, write_json
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(DIR, "public")
-
 CAND = os.path.join(OUT, "candidates.jsonl")
-CAND_MB = os.path.join(OUT, "candidates_mb.jsonl")
+LEGACY_CAND_MB = os.path.join(OUT, "candidates_mb.jsonl")
+PROVIDER_CACHE = os.path.join(OUT, "provider_cache.json")
+FILTER_LOCK = os.path.join(OUT, ".filter.lock")
 VODJSON = os.path.join(OUT, "vod.json")
+DONE = os.path.join(OUT, "genres_done.txt")
 
 GENRES = ["Action", "Adventure", "Animation", "Comedy", "Crime", "Documentary",
           "Drama", "Family", "Fantasy", "History", "Horror", "Music",
           "Mystery", "Romance", "Sci-Fi", "Thriller", "War", "Western"]
 SERIES_EXTRA = ["Reality-TV", "Talk-Show", "Game-Show"]
+PAGES = int(os.environ.get("EASYPLAY_CATALOGUE_PAGES", "30"))
+WORKERS = int(os.environ.get("EASYPLAY_CATALOGUE_WORKERS", "6"))
+LANG = os.environ.get("EASYPLAY_VOD_LANG", "en")
 
-PAGES = 30       # 50 titles per page, per genre
-WORKERS = 6      # this box has 4 GB; 12 workers is enough to OOM it
-LANG = "en"
 
-
-# --------------------------------------------------------------- stage 1
 def load_candidates():
-    seen, out = set(), []
-    if os.path.exists(CAND):
-        with open(CAND, encoding="utf-8") as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                except ValueError:
-                    continue
-                if r["imdb_id"] not in seen:
-                    seen.add(r["imdb_id"])
-                    out.append(r)
+    records, malformed = read_jsonl(CAND)
+    out, seen = [], set()
+    for item in records:
+        if not isinstance(item, dict) or not item.get("imdb_id"):
+            malformed = True
+            continue
+        iid = item["imdb_id"]
+        if iid not in seen:
+            seen.add(iid)
+            out.append(item)
+    if malformed:
+        print("warning: ignored malformed candidate rows; rerun with --rebuild", flush=True)
     return out, seen
 
 
-def stage_candidates():
+def _done_genres():
+    try:
+        with open(DONE, encoding="utf-8") as f:
+            return {line.strip() for line in f if line.strip()}
+    except FileNotFoundError:
+        return set()
+
+
+def _write_genres(keys):
+    atomic_write(DONE, "".join(k + "\n" for k in sorted(keys)))
+
+
+def stage_candidates(rebuild=False):
     os.makedirs(OUT, exist_ok=True)
-    existing, seen = load_candidates()
-    done_keys = _done_genres()
-    # resume from whatever is already on disk
-    with open(CAND, "a", encoding="utf-8") as fh:
-        for kind, genres in (("movie", GENRES), ("series", GENRES + SERIES_EXTRA)):
-            for g in genres:
-                key = "%s/%s" % (kind, g)
-                if key in done_keys:
-                    continue
-                for p in range(PAGES):
-                    path = "catalog/%s/top/genre=%s&skip=%d.json" % (kind, g, p * 50)
+    if rebuild:
+        for path in (CAND, DONE, PROVIDER_CACHE):
+            with contextlib.suppress(FileNotFoundError):
+                os.remove(path)
+    _, seen = load_candidates()
+    done_keys = set() if rebuild else _done_genres()
+    records = []
+
+    for kind, genres in (("movie", GENRES), ("series", GENRES + SERIES_EXTRA)):
+        for genre in genres:
+            key = "%s/%s" % (kind, genre)
+            if key in done_keys:
+                continue
+            genre_records = []
+            complete = True
+            for page_number in range(PAGES):
+                path = "catalog/%s/top/genre=%s&skip=%d.json" % (
+                    kind, genre, page_number * 50)
+                page = None
+                for attempt in range(3):
                     try:
                         page = vod.cinemeta(path).get("metas") or []
+                        break
                     except Exception as e:
-                        print("catalog %s/%s p%d: %s" % (kind, g, p, e), flush=True)
-                        break
-                    if not page:
-                        break
-                    for m in page:
-                        iid = m.get("imdb_id") or m.get("id") or ""
-                        if not iid.startswith("tt") or iid in seen:
-                            continue
-                        seen.add(iid)
-                        rec = {
-                            "imdb_id": iid,
-                            "name": m.get("name") or "",
-                            "year": str(m.get("releaseInfo") or m.get("year") or "")[:4],
-                            "poster": m.get("poster") or "",
-                            "background": m.get("background") or "",
-                            "description": (m.get("description") or "").replace("\n", " ").strip(),
-                            "genres": m.get("genre") or [],
-                            "rating": m.get("imdbRating") or "",
-                            "type": kind,
-                        }
-                        fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                    fh.flush()
-                print("  %s/%-12s total %d" % (kind, g, len(seen)), flush=True)
-                _mark_genre(key)
+                        if attempt == 2:
+                            print("catalog %s p%d failed: %s" % (key, page_number, e),
+                                  flush=True)
+                        else:
+                            time.sleep(attempt + 1)
+                if page is None:
+                    # Do not mark an incomplete genre as complete.
+                    complete = False
+                    break
+                if not page:
+                    break
+                for meta in page:
+                    iid = meta.get("imdb_id") or meta.get("id") or ""
+                    if not iid.startswith("tt") or iid in seen:
+                        continue
+                    seen.add(iid)
+                    record = {
+                        "imdb_id": iid,
+                        "name": meta.get("name") or "",
+                        "year": str(meta.get("releaseInfo") or meta.get("year") or "")[:4],
+                        "poster": meta.get("poster") or "",
+                        "background": meta.get("background") or "",
+                        "description": (meta.get("description") or "").replace("\n", " ").strip(),
+                        "genres": meta.get("genre") or [],
+                        "rating": meta.get("imdbRating") or "",
+                        "type": kind,
+                    }
+                    records.append(record)
+                    genre_records.append(record)
+                print("  %s page %d: %d total" % (key, page_number, len(seen)), flush=True)
+            if complete:
+                # A short feed also ends in `break` above and is complete.
+                done_keys.add(key)
+            existing, _ = load_candidates()
+            atomic_write(CAND, "".join(json.dumps(r, ensure_ascii=False) + "\n"
+                                       for r in existing + records))
+            records = []
+            _write_genres(done_keys)
+            print("  %s complete: %d unique" % (key, len(seen)), flush=True)
     print("candidates: %d" % len(seen), flush=True)
 
 
-DONE = os.path.join(OUT, "genres_done.txt")
+def provider_result(item, attempts=3):
+    """(supported, answer_known); a transport failure is never cached as no."""
+    for attempt in range(attempts):
+        try:
+            detail = vod.title(item["imdb_id"], item["type"], lang=LANG)
+            return bool(detail and "moviebox" in (detail.get("providers") or [])), True
+        except Exception:
+            if attempt < attempts - 1:
+                time.sleep(attempt + 1)
+    return False, False
 
 
-def _done_genres():
-    if not os.path.exists(DONE):
-        return set()
-    with open(DONE, encoding="utf-8") as f:
-        return {l.strip() for l in f if l.strip()}
-
-
-def _mark_genre(key):
-    with open(DONE, "a", encoding="utf-8") as f:
-        f.write(key + "\n")
-
-
-# --------------------------------------------------------------- stage 2
-def provider_ok(item):
-    try:
-        d = vod.title(item["imdb_id"], item["type"], lang=LANG)
-    except Exception:
-        return False          # 404/502 for an unknown title is normal, not fatal
-    return bool(d and "moviebox" in (d.get("providers") or []))
+def _legacy_provider_cache():
+    """One-time import from the old positive-only JSONL, if it exists."""
+    records, _ = read_jsonl(LEGACY_CAND_MB)
+    return {r["imdb_id"]: {"supported": True, "key": ""}
+            for r in records if isinstance(r, dict) and r.get("imdb_id")}
 
 
 def stage_filter():
     items, _ = load_candidates()
-    todo = [i for i in items if i["imdb_id"] not in _mb_ids()]
-    print("filter: %d candidates, %d already done" % (len(todo), len(_mb_ids())), flush=True)
-    done = 0
-    with open(CAND_MB, "a", encoding="utf-8") as out, \
-            concurrent.futures.ThreadPoolExecutor(WORKERS) as ex:
-        futs = {ex.submit(provider_ok, i): i for i in todo}
-        for fut in concurrent.futures.as_completed(futs):
-            item = futs[fut]
-            done += 1
-            try:
-                ok = fut.result()
-            except Exception:
-                ok = False
-            if ok:
-                out.write(json.dumps({k: item[k] for k in
-                                      ("imdb_id", "name", "year", "type",
-                                       "poster", "genres")}, ensure_ascii=False) + "\n")
-                out.flush()
-            if done % 2000 == 0:
-                print("  filter %d/%d" % (done, len(todo)), flush=True)
-    print("filter: %d moviebox titles" % len(_mb_ids()), flush=True)
+    cache = read_json(PROVIDER_CACHE, None)
+    if not isinstance(cache, dict):
+        cache = _legacy_provider_cache()
+    if cache:
+        write_json(PROVIDER_CACHE, cache)
+    os.makedirs(OUT, exist_ok=True)
+    with open(FILTER_LOCK, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            raise SystemExit("another catalogue filter is already running")
+        todo = [item for item in items
+                if item["imdb_id"] not in cache
+                or (cache[item["imdb_id"]].get("key")
+                    and cache[item["imdb_id"]].get("key") != cache_key(item))]
+        print("filter: %d lookups, %d cached" % (len(todo), len(items) - len(todo)),
+              flush=True)
+        if not todo:
+            return
 
-
-def _mb_ids():
-    ids = set()
-    if os.path.exists(CAND_MB):
-        with open(CAND_MB, encoding="utf-8") as f:
-            for line in f:
+        completed = 0
+        with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
+            futures = {pool.submit(provider_result, item): item for item in todo}
+            for future in concurrent.futures.as_completed(futures):
+                item = futures[future]
                 try:
-                    ids.add(json.loads(line)["imdb_id"])
+                    supported, known = future.result()
                 except Exception:
-                    pass
-    return ids
+                    supported, known = False, False
+                if known:
+                    cache[item["imdb_id"]] = {
+                        "key": cache_key(item),
+                        "supported": supported,
+                    }
+                completed += 1
+                if completed % 250 == 0 or completed == len(todo):
+                    write_json(PROVIDER_CACHE, cache)
+                    print("  filter %d/%d" % (completed, len(todo)), flush=True)
+        supported = sum(1 for item in items
+                        if cache.get(item["imdb_id"], {}).get("supported"))
+        print("filter: %d moviebox titles" % supported, flush=True)
 
 
-# --------------------------------------------------------------- stage 3
 def verify(item, attempts=3):
-    """Resolve a real stream; keep only direct MP4s.
-
-    Concurrency causes a few percent of resolves to fail spuriously (the
-    playback endpoint rate-limits), so a None is retried with backoff before a
-    title is written off. Without this the catalogue silently loses titles.
-    """
-    for n in range(attempts):
+    """Keep only a title whose real playback resolution returns a direct MP4."""
+    for attempt in range(attempts):
         try:
             if item["type"] == "series":
-                r = vod.resolve(item["imdb_id"], 1, 1, lang=LANG, provider="moviebox")
+                result = vod.resolve(item["imdb_id"], 1, 1, lang=LANG,
+                                     provider="moviebox")
             else:
-                r = vod.resolve(item["imdb_id"], lang=LANG, provider="moviebox")
+                result = vod.resolve(item["imdb_id"], lang=LANG,
+                                     provider="moviebox")
         except Exception:
-            r = None
-        if r and r.get("kind") == "direct" and r.get("url"):
-            item = dict(item)
-            item["resolution"] = r.get("resolution") or 0
-            return item
-        if n < attempts - 1:
-            time.sleep(1.5 * (n + 1))
+            result = None
+        if result and result.get("kind") == "direct" and result.get("url"):
+            record = dict(item)
+            record["resolution"] = result.get("resolution") or 0
+            return record
+        if attempt < attempts - 1:
+            time.sleep(1.5 * (attempt + 1))
     return None
 
 
 def episodes_of(imdb_id):
     try:
-        eps = vod.episodes(imdb_id, lang=LANG)
+        episodes = vod.episodes(imdb_id, lang=LANG)
     except Exception:
         return []
-    # vod.episodes returns (season, episode, availability)
-    return [{"season": s, "episode": e} for s, e, _avail in eps if s and e]
+    return [{"season": season, "episode": episode}
+            for season, episode, _availability in episodes if season and episode]
 
 
 def stage_verify():
-    cands = {}
-    for item in load_candidates()[0]:
-        cands[item["imdb_id"]] = item
-    mb = []
-    with open(CAND_MB, encoding="utf-8") as f:
-        for line in f:
-            try:
-                rec = json.loads(line)
-            except ValueError:
-                continue
-            full = cands.get(rec["imdb_id"], rec)
-            full.update({k: v for k, v in rec.items() if v})
-            mb.append(full)
-    print("verify: %d moviebox titles" % len(mb), flush=True)
+    candidates, _ = load_candidates()
+    cache = read_json(PROVIDER_CACHE, {})
+    if not cache:
+        cache = _legacy_provider_cache()
+    selected = [dict(item) for item in candidates
+                if cache.get(item["imdb_id"], {}).get("supported")]
+    print("verify: %d moviebox titles" % len(selected), flush=True)
 
-    kept_m, kept_s = [], []
-    done = 0
-    with concurrent.futures.ThreadPoolExecutor(WORKERS) as ex:
-        for rec in ex.map(verify, mb):
-            done += 1
-            if rec:
-                (kept_m if rec["type"] == "movie" else kept_s).append(rec)
-            if done % 500 == 0:
-                print("  verify %d/%d -> %d m, %d s"
-                      % (done, len(mb), len(kept_m), len(kept_s)), flush=True)
+    movies, series = [], []
+    with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
+        for number, record in enumerate(pool.map(verify, selected), start=1):
+            if record:
+                (movies if record["type"] == "movie" else series).append(record)
+            if number % 100 == 0:
+                print("  verify %d/%d" % (number, len(selected)), flush=True)
 
-    print("episodes: %d series" % len(kept_s), flush=True)
-    ep_map = {}
-
-    def _eps(sid):
+    def get_episodes(item):
         try:
-            return sid, episodes_of(sid)
+            return item["imdb_id"], episodes_of(item["imdb_id"])
         except Exception:
-            return sid, []
+            return item["imdb_id"], []
 
-    with concurrent.futures.ThreadPoolExecutor(WORKERS) as ex:
-        for sid, eps in ex.map(_eps, [s["imdb_id"] for s in kept_s]):
-            ep_map[sid] = eps or []
-    for s in kept_s:
-        s["episodes"] = ep_map.get(s["imdb_id"], [])
-    kept_s = [s for s in kept_s if s["episodes"]]
-
-    kept_m.sort(key=lambda m: (m["name"].lower(), m["year"]))
-    kept_s.sort(key=lambda s: s["name"].lower())
-    data = {"built_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
-            "movies": kept_m, "series": kept_s}
-    with open(VODJSON, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False)
-    print("wrote %s: %d movies, %d series" % (VODJSON, len(kept_m), len(kept_s)),
+    with concurrent.futures.ThreadPoolExecutor(WORKERS) as pool:
+        episode_map = dict(pool.map(get_episodes, series))
+    for item in series:
+        item["episodes"] = episode_map.get(item["imdb_id"], [])
+    series = [item for item in series if item["episodes"]]
+    movies.sort(key=lambda item: (item["name"].lower(), item["year"], item["imdb_id"]))
+    series.sort(key=lambda item: (item["name"].lower(), item["imdb_id"]))
+    write_json(VODJSON, {
+        "built_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "movies": movies,
+        "series": series,
+    })
+    print("wrote %s: %d movies, %d series" % (VODJSON, len(movies), len(series)),
           flush=True)
 
 
 def main():
-    stages = sys.argv[1:] or ["candidates", "filter", "verify"]
+    args = sys.argv[1:]
+    rebuild = "--rebuild" in args
+    stages = [a for a in args if not a.startswith("--")] or [
+        "candidates", "filter", "verify"]
+    unknown = set(stages) - {"candidates", "filter", "verify"}
+    if unknown:
+        raise SystemExit("unknown stage: %s" % ", ".join(sorted(unknown)))
     started = time.time()
-    for s in stages:
-        print("== %s ==" % s, flush=True)
-        {"candidates": stage_candidates,
-         "filter": stage_filter,
-         "verify": stage_verify}[s]()
+    for stage in stages:
+        print("== %s ==" % stage, flush=True)
+        if stage == "candidates":
+            stage_candidates(rebuild=rebuild)
+        elif stage == "filter":
+            stage_filter()
+        else:
+            stage_verify()
     print("done in %.0fs" % (time.time() - started), flush=True)
 
 

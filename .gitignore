@@ -1,8 +1,17 @@
-.easyplay_device.json
-epg_cache/
-public/
-__pycache__/
-*.pyc
+# Generated runtime data and credentials
 .env
-public/*.jsonl
-public/genres_done.txt
+.easyplay_device.json
+public/
+epg_cache/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.mypy_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store

@@ -16,6 +16,7 @@ import time
 import easyplay
 import epg_index
 from logos import Logos, resolve
+from storage import atomic_write, write_json
 
 DIR = os.path.dirname(os.path.abspath(__file__))
 OUT = os.path.join(DIR, "public")
@@ -146,12 +147,9 @@ def build(refresh=False):
         lines.append(" ".join(bits) + "," + r["name"])
         lines.append(r["url"])
         chno += 1
-    with open(os.path.join(OUT, "playlist.m3u"), "w", encoding="utf-8") as f:
-        f.write("\n".join(lines) + "\n")
+    atomic_write(os.path.join(OUT, "playlist.m3u"), "\n".join(lines) + "\n")
 
-    # Structured channel list for the Xtream proxy (stable ids = list order)
-    with open(os.path.join(OUT, "channels.json"), "w", encoding="utf-8") as f:
-        json.dump(rows, f, ensure_ascii=False)
+    write_json(os.path.join(OUT, "channels.json"), rows)
 
     # Trimmed EPG: only the ids actually referenced
     keep = {r["tvg_id"] for r in rows if r["tvg_id"]}
@@ -162,8 +160,7 @@ def build(refresh=False):
             if text:
                 parts.append(text)
     merged = epg_index.trim_xmltv("\n".join(parts), keep)
-    with open(os.path.join(OUT, "epg.xml"), "w", encoding="utf-8") as f:
-        f.write(merged)
+    atomic_write(os.path.join(OUT, "epg.xml"), merged)
 
     report = {
         "built_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
@@ -176,8 +173,7 @@ def build(refresh=False):
         "unmatched_total": len(unmatched),
         "elapsed_s": round(time.time() - started, 1),
     }
-    with open(os.path.join(OUT, "report.json"), "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=1)
+    atomic_write(os.path.join(OUT, "report.json"), json.dumps(report, indent=1))
 
     for region, s in stats.items():
         t = max(s["total"], 1)
