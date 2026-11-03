@@ -4,3 +4,5 @@ public/
 __pycache__/
 *.pyc
 .env
+public/*.jsonl
+public/genres_done.txt
