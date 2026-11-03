@@ -7,11 +7,7 @@ project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Known issues
-- `xtream_proxy.py` and `deploy/install.py` carry uncommitted local edits in the
-  working tree; `deploy/easyplaytv-live.timer` exists but is not yet committed.
-  Do not deploy from a dirty tree — a rebuild will start from a state that does
-  not match any tag.
+Nothing yet.
 
 ## [1.1.0] — 2026-11-03
 
