@@ -299,6 +299,13 @@ upstream behavior. A 404 for an individual IMDb title is normally cached as
 unavailable; repeated transport failures are not cached as definitive
 negatives. Broad API failures require a client update.
 
+## Changelog
+
+Every release is documented in [CHANGELOG.md](CHANGELOG.md). Note that releases
+here carry **no binary assets** — you run the source in place, so a "release"
+is a marked point in the tree. Pin your deployment to a tag and re-run the
+installer when you want to move.
+
 ## Legal and security
 
 See [SECURITY.md](SECURITY.md) for reporting guidance. No licence is granted
